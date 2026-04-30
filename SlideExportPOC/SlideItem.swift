@@ -44,10 +44,16 @@ enum SelectedTemplate: Hashable {
     case file(URL)
     case installedTheme(name: String)
 
+    /// Pure-XML PowerPoint pipeline: skip Keynote entirely, copy the .potx
+    /// as the base presentation, inject content into its existing
+    /// placeholders, and re-zip as .pptx. See `PPTXTemplateMerger`.
+    case potxOverlay(URL)
+
     var displayLabel: String {
         switch self {
         case .file(let url):           return url.lastPathComponent
         case .installedTheme(let n):   return "Theme: \(n)"
+        case .potxOverlay(let url):    return "PowerPoint template: \(url.lastPathComponent)"
         }
     }
 
@@ -57,6 +63,7 @@ enum SelectedTemplate: Hashable {
         switch self {
         case .file(let url):           return "file:\(url.pathExtension.lowercased())"
         case .installedTheme:          return "installedTheme"
+        case .potxOverlay:             return "potxOverlay"
         }
     }
 }

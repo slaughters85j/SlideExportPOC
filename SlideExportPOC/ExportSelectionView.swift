@@ -171,8 +171,14 @@ struct ExportSelectionView: View {
                     Button("Presentation File (.key / .pptx)…") {
                         chooseTemplateFile()
                     }
+                    if format == .powerPoint {
+                        Divider()
+                        Button("PowerPoint Template (.potx) overlay…") {
+                            choosePotxOverlay()
+                        }
+                    }
                 }
-                .disabled(!isKeynoteInstalled)
+                .disabled(!isKeynoteInstalled && format != .powerPoint)
             }
             Text("Tip: for .kth themes, install once via Keynote (double-click → Add to Theme Chooser), then pick from Installed Keynote Theme. .potx PowerPoint templates aren’t supported — convert to .pptx first.")
                 .font(.caption)
@@ -295,7 +301,8 @@ struct ExportSelectionView: View {
 
         // Only .key and .pptx — .kth flows through the installed-theme path
         // because kn.open(.kth) triggers a modal "Add to Theme Chooser"
-        // dialog every time. .potx is not supported by Keynote scripting.
+        // dialog every time. .potx is handled separately via the overlay
+        // option, which uses pure-Swift XML manipulation rather than Keynote.
         var allowedTypes: [UTType] = []
         if let key  = UTType(filenameExtension: "key")  { allowedTypes.append(key) }
         if let pptx = UTType(filenameExtension: "pptx") { allowedTypes.append(pptx) }
@@ -305,6 +312,22 @@ struct ExportSelectionView: View {
 
         if panel.runModal() == .OK, let url = panel.url {
             selectedTemplate = .file(url)
+        }
+    }
+
+    private func choosePotxOverlay() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a PowerPoint Template (.potx)"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+
+        if let potx = UTType(filenameExtension: "potx") {
+            panel.allowedContentTypes = [potx]
+        }
+
+        if panel.runModal() == .OK, let url = panel.url {
+            selectedTemplate = .potxOverlay(url)
         }
     }
 }

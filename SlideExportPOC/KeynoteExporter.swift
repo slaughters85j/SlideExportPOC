@@ -367,6 +367,19 @@ enum KeynoteExporter {
         aspect: SlideAspect = .wide,
         template: SelectedTemplate? = nil
     ) async throws -> URL {
+
+        // .potxOverlay short-circuits everything: pure-Swift OOXML pipeline,
+        // no Keynote, no Apple Events, no JXA. Handle it before any other
+        // checks. (Doesn't even need Keynote installed — it just needs the
+        // .potx and our chart PNG.)
+        if case .potxOverlay(let potxURL) = template {
+            return try await runPPTXOverlayExport(
+                items: items,
+                aspect: aspect,
+                potxURL: potxURL
+            )
+        }
+
         guard isKeynoteInstalled() else {
             throw KeynoteExporterError.keynoteNotInstalled
         }
@@ -428,6 +441,62 @@ enum KeynoteExporter {
         // 7. Best-effort temp cleanup.
         if let chartPNGURL {
             try? FileManager.default.removeItem(at: chartPNGURL)
+        }
+
+        return outputURL
+    }
+
+    // MARK: .potx overlay path (pure Swift, skips Keynote)
+
+    @MainActor
+    private static func runPPTXOverlayExport(
+        items: [SlideItem],
+        aspect: SlideAspect,
+        potxURL: URL
+    ) async throws -> URL {
+        // 1. Render chart PNG if requested.
+        var chartURL: URL? = nil
+        if items.contains(.chart) {
+            do {
+                chartURL = try ChartRenderer.renderChartToPNG(size: aspect.chartFrame.size)
+            } catch {
+                throw KeynoteExporterError.chartRenderFailed(underlying: error)
+            }
+        }
+
+        // 2. Decide where the output file goes (.pptx output, since this
+        //    path always produces PowerPoint).
+        let outputURL = makeOutputURL(for: .powerPoint)
+
+        // 3. Run the merger off the main actor — XML manipulation + zip
+        //    can take a beat on large templates.
+        let title = items.contains(.titleAndBody) ? SampleContent.title : ""
+
+        let report = try await Task.detached(priority: .userInitiated) {
+            try PPTXTemplateMerger.merge(
+                templateURL: potxURL,
+                title: title,
+                chartImageURL: chartURL,
+                outputURL: outputURL
+            )
+        }.value
+
+        #if DEBUG
+        print("[KeynoteExporter] .potxOverlay merge report:")
+        print("    output:                    \(outputURL.path)")
+        print("    titleInjectedOnSlide:      \(report.titleInjectedOnSlide.map(String.init) ?? "nil")")
+        print("    bodyImageInsertedOnSlide:  \(report.bodyImageInsertedOnSlide.map(String.init) ?? "nil")")
+        print("    bodyPlaceholderGeometry:   \(report.bodyPlaceholderGeometry ?? "nil")")
+        print("    totalSlidesInOutput:       \(report.totalSlidesInOutput)")
+        #endif
+
+        // 4. Best-effort temp cleanup.
+        if let chartURL {
+            try? FileManager.default.removeItem(at: chartURL)
+        }
+
+        guard FileManager.default.fileExists(atPath: outputURL.path) else {
+            throw KeynoteExporterError.exportFileMissing(expectedPath: outputURL.path)
         }
 
         return outputURL
@@ -616,6 +685,20 @@ enum KeynoteExporter {
         case .installedTheme(let name):
             shouldDeleteStarterSlide = true
             let nameLiteral = jsEscape(name)
+            // Two important details for custom installed themes:
+            //
+            // 1. After kn.documents.push(...), the *locally* constructed
+            //    Document specifier may not be a usable handle for further
+            //    operations (it's an unbound spec that hasn't been "claimed"
+            //    by the running app yet). Retrieve the front document from
+            //    kn.documents[0] instead — that's the live one we just pushed.
+            //
+            // 2. Don't override width/height — let the theme's authored
+            //    dimensions win. Forcing them here can leave the theme's
+            //    masters in a half-applied state where doc.masterSlides
+            //    isn't accessible from JXA. The aspect picker is already
+            //    informational-only when a template is selected, so this is
+            //    consistent with the rest of the UI.
             createDocumentStatement = """
             var theme = step("findInstalledTheme", function() {
                 var themesList = kn.themes;
@@ -625,15 +708,17 @@ enum KeynoteExporter {
             });
 
             var doc = step("createDocumentFromTheme", function() {
-                var d = kn.Document({
-                    documentTheme: theme,
-                    width: \(Int(aspect.size.width)),
-                    height: \(Int(aspect.size.height))
-                });
-                kn.documents.push(d);
+                kn.documents.push(kn.Document({ documentTheme: theme }));
+                var d = kn.documents[0];
+                d.name(); // force evaluation
                 return d;
             });
             """
+
+        case .potxOverlay:
+            // .potxOverlay is handled earlier via the pure-XML pipeline and
+            // never reaches JXA script generation.
+            fatalError(".potxOverlay should never reach JXA buildScript")
 
         case .file(let url):
             // Only .key and .pptx reach here — .kth and others are rejected

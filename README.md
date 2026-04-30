@@ -151,32 +151,33 @@ Things to know about templates generally:
 - `.file(.key)` and `.file(.pptx)` paths carry the user's existing slides; the script **does not** delete them — your slides are appended after the originals.
 - For custom themes whose master-slide names don't match Apple's standard conventions ("Title, Content", "Photo - Horizontal", etc.), the master-slide picker falls back to `masters[0]`. The script also writes the resolved master names into a JSON diagnostics object that's pretty-printed to the Xcode console after every successful run, so the available masters are visible without breakpointing.
 
-### 7. PowerPoint `.potx` templates aren't viable through Keynote — two paths forward
+### 7. PowerPoint `.potx` templates: three paths, one of them implemented
 
-Keynote's scripting interface has no API to consume PowerPoint `.potx` template files. The export sheet rejects `.potx` selections up-front with a remediation message.
+Keynote's scripting interface has no API to consume PowerPoint `.potx` files. So `.potx` support requires bypassing Keynote — and this PoC implements one of the two practical paths so DA can reuse the pattern.
 
-**Manual workflow (works today, recommended for one-off exports):**
+**Path A — Manual workflow (works without writing any code).** Export `.pptx` vanilla from SlideExportPOC, open in PowerPoint, **Design → Themes → Browse for Themes…**, pick your `.potx`. PowerPoint applies the template's masters, colors, fonts, and layouts to your existing slides. Confirmed clean. Best for one-offs.
 
-1. Run a vanilla `.pptx` export from SlideExportPOC (no template selected).
-2. Open the resulting `.pptx` in PowerPoint.
-3. **Design tab → Themes → Browse for Themes…** → pick your `.potx`. PowerPoint applies the template's master slides, color/font scheme, and layouts to your existing slides.
-4. Save.
+**Path B — `.potxOverlay` (implemented in `PPTXTemplateMerger.swift`).** A pure-Swift OOXML pipeline: copy the `.potx` as the base, flip the package MIME from `presentationml.template.main+xml` → `presentationml.presentation.main+xml`, inject content into the template's existing slide placeholders, re-zip as `.pptx`. **Doesn't require Keynote at all** — no Apple Events, no install dialogs, no app launch.
 
-This is the path the user confirmed works cleanly and is "not bad at all." Documenting it here for completeness.
+In the export sheet, choose **Choose… → PowerPoint Template (.potx) overlay…** (only visible when Format = PowerPoint). The merger:
 
-**Polished/automated workflow (out of scope for this PoC):**
+- Resolves slide order by numeric suffix on `slide*.xml`.
+- Finds `<p:ph type="title"/>` on slide 1 and replaces its text body with the title string.
+- Finds `<p:ph type="body" idx="1"/>` on slide 2, copies the chart PNG into `ppt/media/`, registers a relationship in `ppt/slides/_rels/slide2.xml.rels`, replaces the body shape with a `<p:pic>` element sized to the body's geometry.
+- Geometry resolution uses a three-tier fallback: layout body `<a:xfrm>` → slide-relative frame from `<p:sldSz>` (8% horizontal / 13% vertical margins) → hardcoded defaults. The middle tier handles the common case where layouts inherit body geometry from the master rather than declaring it directly (true on the sample template).
 
-A `.pptx` is an OOXML zip — `[Content_Types].xml`, `ppt/presentation.xml`, `ppt/slides/slide*.xml`, etc. Once Keynote has produced a `.pptx`, a separate post-processing step could:
+Implementation is ~500 LOC of `Foundation.XMLDocument` plus `/usr/bin/zip` and `/usr/bin/unzip`. No third-party deps.
 
-1. Unzip the exported `.pptx`.
-2. Unzip the `.potx` template; copy `ppt/theme/`, `ppt/slideMasters/`, `ppt/slideLayouts/`, and the corresponding `_rels` into the export.
-3. Rewrite each `slide*.xml` so its placeholders bind to the template's layout via the `<p:ph type="...">` elements that the template expects.
-4. Update `[Content_Types].xml` and the relevant `.rels` files.
-5. Re-zip.
+Findings worth knowing for a production implementation in DA:
 
-This converts "Keynote drove the structure, but the styling came from `.potx`" into a deterministic transform. Realistic implementation surface: ~200-400 LOC of XML manipulation. Worth it if a polished, fully automated PPT pipeline is the goal; not worth it for occasional one-offs (manual workflow above is faster).
+- The `.potx` you author defines the binding contract. The PoC merger assumes "slide 1 has a title placeholder → put title there; slide 2 has a body placeholder → put image there." A more flexible mapping in production would let the template name slides explicitly (e.g. `<p:cNvPr name="Title Slide"/>` / `<p:cNvPr name="Chart Slide"/>`) and have the binding code look up by name rather than slide order.
+- Empty placeholders show layout-level prompt text (e.g. "TITLE", "Click to add subtitle") in PowerPoint's normal/edit view but not in slideshow. If you see prompt text on a slide where you didn't inject content, that's why — it's not actual content.
+- The `<p:pic>` we emit replaces the body `<p:sp>` outright, which removes the placeholder semantics on that slide. PowerPoint still renders the layout's body placeholder beneath as a design hint outline in edit view; in slideshow the picture covers it. If keeping the placeholder semantics matters, the merger would need to insert the `<p:pic>` *alongside* the body shape and either leave the body empty or move the body off-canvas.
+- Slide dimensions in the user's sample `.potx` are non-standard (`cx=24384000 cy=13716000`, ≈26.7"×15") — a Keynote-export style sizing. The slide-relative geometry fallback handles arbitrary canvas sizes correctly.
 
-Out of scope for this PoC — flagging it as the path forward for production code that needs `.potx` parity.
+**Path C — Theme-only swap (not implemented, easy if needed).** Run a vanilla `.pptx` export through Keynote, then post-process: replace just `ppt/theme/theme1.xml`, `ppt/slideMasters/`, and `ppt/slideLayouts/` from the `.potx` into the export, rewrite slide-to-layout relationships, re-zip. Lower ceiling than Path B (Keynote's positioned shapes don't move to match new layouts) but useful if the goal is "Keynote-driven structure, .potx-driven styling."
+
+For DA: Path B is the one to look at. Authoring one canonical `.potx` (and one canonical `.kth` for Keynote) with deterministic placeholder structure converts the export problem into a deterministic content-injection transform. The PoC's `PPTXTemplateMerger.swift` is the reference implementation.
 
 ### 7. Cross-template image placement: text is template-agnostic, images are not (without effort)
 
