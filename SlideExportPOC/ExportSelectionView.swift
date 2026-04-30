@@ -18,7 +18,7 @@ struct ExportSelectionView: View {
     // MARK: Inputs / outputs
 
     /// Called when the user taps Export. The view dismisses itself first.
-    var onExport: (_ items: [SlideItem], _ format: ExportFormat, _ aspect: SlideAspect, _ template: URL?) -> Void
+    var onExport: (_ items: [SlideItem], _ format: ExportFormat, _ aspect: SlideAspect, _ template: SelectedTemplate?) -> Void
 
     // MARK: Local state
 
@@ -27,7 +27,11 @@ struct ExportSelectionView: View {
     @State private var selectedItems: Set<SlideItem> = Set(SlideItem.allCases)
     @State private var format: ExportFormat = .powerPoint
     @State private var aspect: SlideAspect = .wide
-    @State private var customTemplateURL: URL? = nil
+    @State private var selectedTemplate: SelectedTemplate? = nil
+
+    @State private var installedThemes: [String] = []
+    @State private var loadingThemes: Bool = false
+    @State private var showingThemePicker: Bool = false
 
     private let keynoteStatus: KeynoteInstallStatus = KeynoteExporter.keynoteInstallStatus()
     private var isKeynoteInstalled: Bool { keynoteStatus.isUsable }
@@ -134,9 +138,9 @@ struct ExportSelectionView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .disabled(!isKeynoteInstalled || customTemplateURL != nil)
+            .disabled(!isKeynoteInstalled || selectedTemplate != nil)
 
-            if customTemplateURL != nil {
+            if selectedTemplate != nil {
                 Text("Aspect is set by the template when one is selected.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -148,26 +152,99 @@ struct ExportSelectionView: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Custom Template (optional)")
             HStack(spacing: 8) {
-                Text(customTemplateURL?.lastPathComponent ?? "No template selected")
+                Text(selectedTemplate?.displayLabel ?? "No template selected")
                     .font(.callout)
-                    .foregroundStyle(customTemplateURL == nil ? .secondary : .primary)
+                    .foregroundStyle(selectedTemplate == nil ? .secondary : .primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                if customTemplateURL != nil {
-                    Button("Clear") { customTemplateURL = nil }
+                if selectedTemplate != nil {
+                    Button("Clear") { selectedTemplate = nil }
                         .buttonStyle(.borderless)
                 }
 
-                Button("Choose…") { chooseTemplate() }
-                    .disabled(!isKeynoteInstalled)
+                Menu("Choose…") {
+                    Button("Installed Keynote Theme…") {
+                        Task { await loadAndShowThemes() }
+                    }
+                    Button("Presentation File (.key / .pptx)…") {
+                        chooseTemplateFile()
+                    }
+                }
+                .disabled(!isKeynoteInstalled)
             }
-            Text("Using a custom template may result in required edits after export.")
+            Text("Tip: for .kth themes, install once via Keynote (double-click → Add to Theme Chooser), then pick from Installed Keynote Theme. .potx PowerPoint templates aren’t supported — convert to .pptx first.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        .sheet(isPresented: $showingThemePicker) {
+            installedThemePicker
+        }
+    }
+
+    // MARK: Installed-theme picker sheet
+
+    private var installedThemePicker: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Choose Installed Keynote Theme")
+                    .font(.headline)
+                Spacer()
+                Button("Cancel") { showingThemePicker = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(16)
+
+            Divider()
+
+            if loadingThemes {
+                ProgressView().padding(40)
+                    .frame(maxWidth: .infinity)
+            } else if installedThemes.isEmpty {
+                Text("No themes found. Install your .kth via Keynote first (double-click the file → Add to Theme Chooser).")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(20)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                List {
+                    ForEach(installedThemes, id: \.self) { name in
+                        Button {
+                            selectedTemplate = .installedTheme(name: name)
+                            showingThemePicker = false
+                        } label: {
+                            HStack {
+                                Text(name)
+                                Spacer()
+                                if case .installedTheme(let n) = selectedTemplate, n == name {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .frame(width: 420, height: 480)
+    }
+
+    private func loadAndShowThemes() async {
+        loadingThemes = true
+        showingThemePicker = true
+        do {
+            installedThemes = try await KeynoteExporter.listInstalledThemes()
+        } catch {
+            #if DEBUG
+            print("[ExportSelectionView] listInstalledThemes failed: \(error)")
+            #endif
+            installedThemes = []
+        }
+        loadingThemes = false
     }
 
     private var footer: some View {
@@ -177,7 +254,7 @@ struct ExportSelectionView: View {
                 .keyboardShortcut(.cancelAction)
             Button("Export") {
                 let items = SlideItem.allCases.filter { selectedItems.contains($0) }
-                let template = customTemplateURL
+                let template = selectedTemplate
                 let chosenFormat = format
                 let chosenAspect = aspect
                 dismiss()
@@ -209,24 +286,25 @@ struct ExportSelectionView: View {
         )
     }
 
-    private func chooseTemplate() {
+    private func chooseTemplateFile() {
         let panel = NSOpenPanel()
-        panel.title = "Choose a Template"
+        panel.title = "Choose a Presentation File"
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
 
+        // Only .key and .pptx — .kth flows through the installed-theme path
+        // because kn.open(.kth) triggers a modal "Add to Theme Chooser"
+        // dialog every time. .potx is not supported by Keynote scripting.
         var allowedTypes: [UTType] = []
-        if let kth = UTType(filenameExtension: "kth")  { allowedTypes.append(kth) }
-        if let key = UTType(filenameExtension: "key")  { allowedTypes.append(key) }
+        if let key  = UTType(filenameExtension: "key")  { allowedTypes.append(key) }
         if let pptx = UTType(filenameExtension: "pptx") { allowedTypes.append(pptx) }
-        if let potx = UTType(filenameExtension: "potx") { allowedTypes.append(potx) }
         if !allowedTypes.isEmpty {
             panel.allowedContentTypes = allowedTypes
         }
 
         if panel.runModal() == .OK, let url = panel.url {
-            customTemplateURL = url
+            selectedTemplate = .file(url)
         }
     }
 }

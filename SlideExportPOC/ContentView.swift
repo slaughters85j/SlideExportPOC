@@ -222,7 +222,7 @@ struct ContentView: View {
 
     // MARK: Export handler
 
-    private func handleExport(items: [SlideItem], format: ExportFormat, aspect: SlideAspect, template: URL?) {
+    private func handleExport(items: [SlideItem], format: ExportFormat, aspect: SlideAspect, template: SelectedTemplate?) {
         isExporting = true
         Task {
             defer { isExporting = false }
@@ -231,7 +231,7 @@ struct ContentView: View {
                     items: items,
                     format: format,
                     aspect: aspect,
-                    customTemplateURL: template
+                    template: template
                 )
                 exportResult = .success(url)
             } catch let kerr as KeynoteExporterError {

@@ -24,6 +24,43 @@ enum SlideItem: String, CaseIterable, Identifiable, Hashable {
     }
 }
 
+// MARK: - SelectedTemplate
+
+/// Identifies a custom template the user has chosen for export. Two paths:
+/// - `.file(url)` — the user picked a `.key` or `.pptx` file from disk.
+///   Keynote opens it directly via `kn.open(Path(...))` and we use the
+///   resulting document as the base.
+/// - `.installedTheme(name)` — the user picked a theme from the list of
+///   themes already installed in Keynote. We construct a fresh document
+///   via `kn.Document({documentTheme: kn.themes["name"]})` — no file open,
+///   no install dialog.
+///
+/// `.kth` files are NOT routed through `.file(...)` because `kn.open` of a
+/// `.kth` triggers Keynote's "Add to Theme Chooser" install dialog every
+/// time. The intended workflow is: user installs the `.kth` once via
+/// Keynote (double-click → Add to Theme Chooser), then picks it from the
+/// installed-theme list here.
+enum SelectedTemplate: Hashable {
+    case file(URL)
+    case installedTheme(name: String)
+
+    var displayLabel: String {
+        switch self {
+        case .file(let url):           return url.lastPathComponent
+        case .installedTheme(let n):   return "Theme: \(n)"
+        }
+    }
+
+    /// Short tag used in JXA diagnostics so the JSON output indicates which
+    /// template path drove the document construction.
+    var diagnosticMode: String {
+        switch self {
+        case .file(let url):           return "file:\(url.pathExtension.lowercased())"
+        case .installedTheme:          return "installedTheme"
+        }
+    }
+}
+
 // MARK: - SlideAspect
 
 /// Slide dimensions / aspect ratio. Keynote refers to these as "Wide" and

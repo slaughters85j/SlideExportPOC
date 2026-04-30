@@ -11,7 +11,10 @@ This is a **proof of concept**, not a library. It exists to validate an architec
 - Rendering a SwiftUI Charts view to a PNG via `ImageRenderer` and embedding it as an image on a Keynote slide.
 - Exporting to `.pptx` (via Keynote's `export` verb) or saving as `.key` (via Keynote's `save` verb — they are different APIs; see below).
 - Output aspect ratio selection: **Wide (16:9, 1920×1080)** or **Standard (4:3, 1024×768)** — Keynote's own preset names.
-- Custom template support: `.kth` Keynote themes, `.key` and `.pptx` real presentations as base documents (all via `kn.open`). PowerPoint `.potx` is detected up-front and rejected with a clear remediation message (Keynote can't consume it; convert to `.pptx` first).
+- Custom template support — two routes:
+  - **Installed Keynote themes** (recommended for `.kth`): the app queries `kn.themes` and lets the user pick a theme by name. Document is created via `kn.Document({documentTheme: kn.themes["…"], ...})`. No file open, no Keynote install dialog.
+  - **Presentation file (`.key` / `.pptx`)**: opened directly with `kn.open(Path(...))`; your slides are appended to whatever's already there.
+  - PowerPoint `.potx` is detected up-front and rejected with a remediation message — Keynote scripting can't consume it; the README documents both the manual workflow that works today and the OOXML post-processing path for a polished automated pipeline.
 - A placeholder-discovery experiment for the chart slide that demonstrates one path toward template-aware image placement (see Item 4 in "Gotchas" below).
 - Validating "is the genuine Apple Keynote installed?" via `SecRequirementCreateWithString` + `SecStaticCodeCheckValidity` against the requirement `anchor apple generic and identifier "com.apple.Keynote"`.
 
@@ -123,21 +126,57 @@ function step(name, fn) {
 
 If you change anything that affects the app's code signature (entitlements, Info.plist keys, signing identity) between builds, TCC may need to re-prompt. Conversely, if a previous build silently denied due to the issues above, the cached state can persist across builds. The in-app **Reset Permission & Quit** button runs `tccutil reset AppleEvents <bundle-id>` and terminates the app so the next launch starts fresh.
 
-### 6. Custom templates: viable for `.kth` / `.key` / `.pptx`, not viable for `.potx`
+### 6. Custom templates: two routes, depending on the file type
 
-Keynote's `kn.open(Path(...))` consumes Keynote themes (`.kth`), real Keynote presentations (`.key`), and PowerPoint presentations (`.pptx`) as base documents. Append your slides to whatever it returns and the resulting document inherits the template's theme, masters, and (for `.key` / `.pptx`) any pre-authored content.
+The app surfaces two ways to pick a template via a "Choose…" Menu in the export sheet:
 
-Things to know:
+- **Installed Keynote Theme…** — lists every theme currently registered with Keynote (built-in + user-installed) by querying `kn.themes`. Pick one and the exporter creates a new document via `kn.Document({documentTheme: kn.themes["<name>"]})`. **No file open, no install dialog.** This is the right path for `.kth` themes.
+- **Presentation File (.key / .pptx)…** — `NSOpenPanel` for an actual presentation file. The exporter calls `kn.open(Path(<file>))` and your slides are appended to whatever the file already contains.
 
-- Opening a `.kth` for the first time may show Keynote's "Add to Theme Chooser" prompt. After accepting once, subsequent opens are silent.
-- When a custom template is supplied, the **template's slide dimensions win** — the aspect picker is informational only. The export sheet greys out the picker and notes this.
-- `.kth` templates produce a single auto-created starter slide; the script deletes that after appending its own content (matching the no-template flow).
-- `.key` and `.pptx` templates carry the user's existing slides; the script **does not** delete them — your slides are appended after the originals.
+`.kth` files cannot be picked from the file panel directly. `kn.open(Path("file.kth"))` triggers Keynote's modal "Add to Theme Chooser" install dialog **every time** — even after the user accepts it. Routing `.kth` through the installed-theme list bypasses that dialog entirely.
 
-PowerPoint `.potx` templates are not viable. Keynote's scripting interface has no path to consume them. Two workarounds, in order of pragmatism:
+Workflow for a custom `.kth`:
 
-1. Open the `.potx` in PowerPoint and Save As `.pptx`. Pick the resulting `.pptx` as the template here. (Recommended; documented in the in-app error message.)
-2. For a fully native PowerPoint pipeline that can consume `.potx` directly, you'd need a different tool entirely (e.g. a Python-side python-pptx step). Outside this PoC's scope.
+1. Author your `.kth` in Keynote (File → Save as Theme…) or download one.
+2. Double-click it in Finder. Keynote prompts "Add to Theme Chooser" — click it.
+3. In SlideExportPOC, open the export sheet and pick **Choose… → Installed Keynote Theme…**. Your theme will be in the list. Pick it.
+4. Run the export. The document is created against your theme; the master-slide names from your theme drive layout selection.
+
+If you accidentally pass a `.kth` path through the file picker (say, programmatically), the app surfaces a clear error pointing at the installed-theme path.
+
+Things to know about templates generally:
+
+- When a template is supplied, the **template's slide dimensions win** — the aspect picker is informational only and the export sheet greys it out with a note.
+- `.installedTheme` paths produce a single auto-created starter slide; the script deletes that after appending its own content (matching the no-template flow).
+- `.file(.key)` and `.file(.pptx)` paths carry the user's existing slides; the script **does not** delete them — your slides are appended after the originals.
+- For custom themes whose master-slide names don't match Apple's standard conventions ("Title, Content", "Photo - Horizontal", etc.), the master-slide picker falls back to `masters[0]`. The script also writes the resolved master names into a JSON diagnostics object that's pretty-printed to the Xcode console after every successful run, so the available masters are visible without breakpointing.
+
+### 7. PowerPoint `.potx` templates aren't viable through Keynote — two paths forward
+
+Keynote's scripting interface has no API to consume PowerPoint `.potx` template files. The export sheet rejects `.potx` selections up-front with a remediation message.
+
+**Manual workflow (works today, recommended for one-off exports):**
+
+1. Run a vanilla `.pptx` export from SlideExportPOC (no template selected).
+2. Open the resulting `.pptx` in PowerPoint.
+3. **Design tab → Themes → Browse for Themes…** → pick your `.potx`. PowerPoint applies the template's master slides, color/font scheme, and layouts to your existing slides.
+4. Save.
+
+This is the path the user confirmed works cleanly and is "not bad at all." Documenting it here for completeness.
+
+**Polished/automated workflow (out of scope for this PoC):**
+
+A `.pptx` is an OOXML zip — `[Content_Types].xml`, `ppt/presentation.xml`, `ppt/slides/slide*.xml`, etc. Once Keynote has produced a `.pptx`, a separate post-processing step could:
+
+1. Unzip the exported `.pptx`.
+2. Unzip the `.potx` template; copy `ppt/theme/`, `ppt/slideMasters/`, `ppt/slideLayouts/`, and the corresponding `_rels` into the export.
+3. Rewrite each `slide*.xml` so its placeholders bind to the template's layout via the `<p:ph type="...">` elements that the template expects.
+4. Update `[Content_Types].xml` and the relevant `.rels` files.
+5. Re-zip.
+
+This converts "Keynote drove the structure, but the styling came from `.potx`" into a deterministic transform. Realistic implementation surface: ~200-400 LOC of XML manipulation. Worth it if a polished, fully automated PPT pipeline is the goal; not worth it for occasional one-offs (manual workflow above is faster).
+
+Out of scope for this PoC — flagging it as the path forward for production code that needs `.potx` parity.
 
 ### 7. Cross-template image placement: text is template-agnostic, images are not (without effort)
 

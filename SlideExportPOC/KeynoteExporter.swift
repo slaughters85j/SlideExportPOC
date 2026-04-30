@@ -44,6 +44,7 @@ enum KeynoteExporterError: LocalizedError {
     case chartRenderFailed(underlying: Error)
     case exportFileMissing(expectedPath: String)
     case unsupportedTemplateType(extension: String)
+    case kthThemeNotInstalled(suggestedName: String)
     case unknown(String)
 
     var errorDescription: String? {
@@ -70,6 +71,12 @@ enum KeynoteExporterError: LocalizedError {
 
             Workaround: open the .potx in PowerPoint, save it as .pptx, then select the .pptx as the template here.
             """
+        case .kthThemeNotInstalled(let name):
+            return """
+            That .kth theme is not installed in Keynote yet.
+
+            To install it, double-click the .kth file in Finder, then click "Add to Theme Chooser" in Keynote. After that, reopen this export sheet and pick "\(name)" from the "Installed Theme" menu — that path bypasses the install dialog.
+            """
         case .unknown(let message):
             return message
         }
@@ -82,7 +89,12 @@ enum KeynoteExporterError: LocalizedError {
 /// surfaced via the OSAKit error dictionary's `OSAScriptErrorNumber`. Used
 /// for diagnostic logging — not exhaustive, just the failure modes we expect
 /// to actually hit when driving Keynote from a host app.
-private func decodeOSAStatusCode(_ code: Int) -> String {
+///
+/// Marked `nonisolated` because it's called from `runJXA(_:)` which is
+/// nonisolated — the project's default `MainActor` actor isolation would
+/// otherwise force this onto the main actor and produce a Swift 6
+/// concurrency warning at every call site.
+nonisolated private func decodeOSAStatusCode(_ code: Int) -> String {
     switch code {
     case    0: return "noErr (success)"
     case -128: return "userCanceledErr — the user canceled."
@@ -295,6 +307,44 @@ enum KeynoteExporter {
         )
     }
 
+    // MARK: Public — list installed themes
+
+    /// Returns the names of every theme currently installed in Keynote
+    /// (built-in + user-installed). The export sheet uses this to populate
+    /// the "Installed Theme" picker so the user can route around the
+    /// `kn.open(.kth)` install dialog.
+    static func listInstalledThemes() async throws -> [String] {
+        guard isKeynoteInstalled() else {
+            throw KeynoteExporterError.keynoteNotInstalled
+        }
+
+        let script = """
+        (function() {
+            var kn = Application("Keynote");
+            var names = [];
+            try {
+                var ts = kn.themes;
+                var raw = ts.name();
+                if (Array.isArray(raw)) names = raw;
+                else if (typeof raw === "string") names = [raw];
+            } catch (e) {}
+            return JSON.stringify(names);
+        })();
+        """
+
+        let json = try await Task.detached(priority: .userInitiated) { () -> String in
+            try runJXAReturningString(script)
+        }.value
+
+        guard
+            let data = json.data(using: .utf8),
+            let names = try? JSONDecoder().decode([String].self, from: data)
+        else {
+            return []
+        }
+        return names
+    }
+
     // MARK: Public export entry point
 
     /// Renders any required assets, builds a JXA script, drives Keynote
@@ -306,26 +356,33 @@ enum KeynoteExporter {
     ///   - format: `.keynote` (.key, via `kn.save`) or `.powerPoint` (.pptx,
     ///             via `kn.export(as: "Microsoft PowerPoint")`).
     ///   - aspect: 16:9 (`.wide`) or 4:3 (`.standard`). Ignored when a
-    ///             custom template is supplied — template dimensions win.
-    ///   - customTemplateURL: Optional .kth / .key / .pptx to use as the
-    ///             base document. .potx is rejected up-front.
+    ///             template is supplied — template dimensions win.
+    ///   - template: Optional template (`.installedTheme(name)` for .kth
+    ///             themes already installed in Keynote, or `.file(url)` for
+    ///             a `.key` / `.pptx` base presentation).
     @MainActor
     static func exportToKeynote(
         items: [SlideItem],
         format: ExportFormat,
         aspect: SlideAspect = .wide,
-        customTemplateURL: URL? = nil
+        template: SelectedTemplate? = nil
     ) async throws -> URL {
         guard isKeynoteInstalled() else {
             throw KeynoteExporterError.keynoteNotInstalled
         }
 
-        // 1. Validate template type up-front.
-        if let template = customTemplateURL {
-            let ext = template.pathExtension.lowercased()
+        // 1. Validate template up-front.
+        if case .file(let url) = template {
+            let ext = url.pathExtension.lowercased()
             switch ext {
-            case "kth", "key", "pptx":
-                break // supported via kn.open
+            case "key", "pptx":
+                break // these open natively via kn.open without a dialog
+            case "kth":
+                // .kth via .file(...) is a misroute — surface a helpful error
+                // pointing at the installed-theme path. We don't try kn.open()
+                // because that triggers the install dialog every time.
+                let suggestedName = url.deletingPathExtension().lastPathComponent
+                throw KeynoteExporterError.kthThemeNotInstalled(suggestedName: suggestedName)
             case "potx":
                 throw KeynoteExporterError.unsupportedTemplateType(extension: "potx")
             default:
@@ -355,7 +412,7 @@ enum KeynoteExporter {
             aspect: aspect,
             outputURL: outputURL,
             chartPNGURL: chartPNGURL,
-            templateURL: customTemplateURL
+            template: template
         )
 
         // 5. Run OSAKit off the main actor — `executeAndReturnError` is blocking.
@@ -397,6 +454,28 @@ enum KeynoteExporter {
     /// Runs a JXA source string via OSAKit. Marked `nonisolated` so the
     /// project's default-MainActor isolation doesn't force this blocking call
     /// onto the main thread — we deliberately invoke it from a detached task.
+    /// Runs a JXA source string and returns its string return value.
+    /// Used by helpers that genuinely care about the result (e.g.
+    /// `listInstalledThemes()` returning a JSON array).
+    nonisolated private static func runJXAReturningString(_ source: String) throws -> String {
+        guard let language = OSALanguage(forName: "JavaScript") else {
+            throw KeynoteExporterError.unknown("JavaScript scripting language unavailable on this system.")
+        }
+        let script = OSAScript(source: source, language: language)
+        var errorDict: NSDictionary?
+        let result = script.executeAndReturnError(&errorDict)
+        if let errorDict {
+            let asSwiftDict: [String: Any] = (errorDict as? [String: Any]) ?? [:]
+            let message = (asSwiftDict[OSAScriptErrorMessage] as? String) ?? "Unknown scripting error."
+            let code = (asSwiftDict[OSAScriptErrorNumber] as? Int) ?? -1
+            if code == -1743 {
+                throw KeynoteExporterError.automationPermissionDenied
+            }
+            throw KeynoteExporterError.scriptingFailed(message: message, code: code, fullErrorDictionary: asSwiftDict)
+        }
+        return result?.stringValue ?? ""
+    }
+
     nonisolated private static func runJXA(_ source: String) throws {
         guard let language = OSALanguage(forName: "JavaScript") else {
             throw KeynoteExporterError.unknown("JavaScript scripting language unavailable on this system.")
@@ -416,7 +495,17 @@ enum KeynoteExporter {
         guard let errorDict else {
             #if DEBUG
             if let result {
-                print("[KeynoteExporter] JXA executed successfully. Result descriptor: \(result.stringValue ?? "<no string value>")")
+                let raw = result.stringValue ?? "<no string value>"
+                // If the script returned a JSON diagnostic object, pretty-print it.
+                if let data = raw.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data),
+                   let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
+                   let prettyString = String(data: pretty, encoding: .utf8) {
+                    print("[KeynoteExporter] JXA returned diagnostic JSON:")
+                    print(prettyString)
+                } else {
+                    print("[KeynoteExporter] JXA executed successfully. Result descriptor: \(raw)")
+                }
             }
             #endif
             return
@@ -464,7 +553,7 @@ enum KeynoteExporter {
         aspect: SlideAspect,
         outputURL: URL,
         chartPNGURL: URL?,
-        templateURL: URL?
+        template: SelectedTemplate?
     ) -> String {
         // Build the per-slide JS blocks first so we can keep the wrapper clean.
         var slideBlocks: [String] = []
@@ -505,36 +594,63 @@ enum KeynoteExporter {
             """#
         }
 
-        // Document-construction step varies based on whether a template was
-        // supplied. With a template we open the file (Keynote opens .kth
-        // .key and .pptx natively); the template's theme & dimensions win.
-        // Without a template we create a fresh document at the requested
-        // aspect using the "White" theme.
+        // Document-construction step varies based on the selected template:
         //
-        // We also need to know whether to delete a starter slide afterwards:
-        // - No template: yes, Keynote auto-creates one.
-        // - .kth template: yes, opening a theme file creates a starter slide.
-        // - .key / .pptx template: NO — those files contain the user's own
-        //   slides which we should preserve.
+        // - No template:                Create with built-in "White" theme,
+        //                               at the chosen aspect.
+        // - .installedTheme(name):      Create via kn.Document({documentTheme:
+        //                               kn.themes["name"], width, height}). No
+        //                               file open, no install dialog.
+        // - .file(.key) / .file(.pptx): Open the file via kn.open. The doc's
+        //                               existing slides remain.
+        //
+        // Starter-slide deletion:
+        // - No template / .installedTheme: yes — Keynote auto-creates one,
+        //   we delete it after appending our slides.
+        // - .file(.key/.pptx): NO — those files carry the user's own slides
+        //   which we preserve. Our slides are appended after.
         let createDocumentStatement: String
         let shouldDeleteStarterSlide: Bool
 
-        if let templateURL {
-            let templateLiteral = jsEscape(templateURL.path)
-            let ext = templateURL.pathExtension.lowercased()
-            shouldDeleteStarterSlide = (ext == "kth")
+        switch template {
+        case .installedTheme(let name):
+            shouldDeleteStarterSlide = true
+            let nameLiteral = jsEscape(name)
+            createDocumentStatement = """
+            var theme = step("findInstalledTheme", function() {
+                var themesList = kn.themes;
+                var t = themesList["\(nameLiteral)"];
+                t.name(); // force evaluation; throws if not installed
+                return t;
+            });
+
+            var doc = step("createDocumentFromTheme", function() {
+                var d = kn.Document({
+                    documentTheme: theme,
+                    width: \(Int(aspect.size.width)),
+                    height: \(Int(aspect.size.height))
+                });
+                kn.documents.push(d);
+                return d;
+            });
+            """
+
+        case .file(let url):
+            // Only .key and .pptx reach here — .kth and others are rejected
+            // up-front in exportToKeynote(...).
+            shouldDeleteStarterSlide = false
+            let templateLiteral = jsEscape(url.path)
             createDocumentStatement = """
             var doc = step("openTemplate", function() {
                 var d = kn.open(Path("\(templateLiteral)"));
                 if (!d) {
-                    // kn.open sometimes returns the document indirectly; fall
-                    // back to the front document.
                     d = kn.documents[0];
                 }
                 return d;
             });
             """
-        } else {
+
+        case .none:
             shouldDeleteStarterSlide = true
             createDocumentStatement = """
             var theme = step("findTheme", function() {
@@ -608,8 +724,29 @@ enum KeynoteExporter {
                 return a;
             });
 
+            // Diagnostic accumulator surfaced back to Swift via JSON.
+            // The host app pretty-prints this in the Xcode console after a
+            // successful run, which makes "what's actually in this template"
+            // debuggable without breakpointing through OSAKit.
+            var diagnostics = {
+                templateMode: "\(template?.diagnosticMode ?? "none")",
+                masterSlideNames: [],
+                titleBodyMaster: null,
+                chartMaster: null,
+                chartPlacement: "default"
+            };
+
             // 1. Document construction — varies based on template vs. no template.
             \(createDocumentStatement)
+
+            // 1a. Enumerate master-slide names for diagnostics.
+            step("listMasters", function() {
+                try {
+                    var raw = doc.masterSlides.name();
+                    if (Array.isArray(raw)) diagnostics.masterSlideNames = raw;
+                    else if (typeof raw === "string") diagnostics.masterSlideNames = [raw];
+                } catch (e) { /* leave empty */ }
+            });
 
             // 2. Capture the starter slide if we should delete it later.
             \(starterSlideHandling)
@@ -635,7 +772,7 @@ enum KeynoteExporter {
                 doc.close({ saving: "no" });
             });
 
-            return "ok";
+            return JSON.stringify(diagnostics);
         })();
         """
     }
@@ -648,18 +785,35 @@ enum KeynoteExporter {
 
         return """
         step("titleBodySlide", function() {
+            var pickedName = null;
             var master = (function() {
                 var masters = doc.masterSlides;
-                var preferred = ["Title, Content", "Title & Bullets", "Title & Content", "Title - Top", "Title"];
+                var preferred = [
+                    "Title, Content", "Title & Bullets", "Title & Content",
+                    "Title - Top", "Title - Center", "Title", "Title & Subtitle"
+                ];
+                // Try Apple's standard names first.
                 for (var p = 0; p < preferred.length; p++) {
                     try {
                         var m = masters[preferred[p]];
-                        m.name(); // force evaluation
+                        var n = m.name();
+                        pickedName = n;
                         return m;
                     } catch (e) { /* try next */ }
                 }
-                return masters[0];
+                // Fall back to the first available master in the template.
+                // For custom themes whose master names don't match Apple's
+                // defaults, this is the right move — the template author
+                // likely curated their masters in display order.
+                try {
+                    var first = masters[0];
+                    pickedName = first.name();
+                    return first;
+                } catch (e) {
+                    throw new Error("no master slides available on this document");
+                }
             })();
+            diagnostics.titleBodyMaster = pickedName;
 
             var slide = kn.Slide({ baseSlide: master });
             doc.slides.push(slide);
@@ -687,6 +841,7 @@ enum KeynoteExporter {
         // aspect-relative chart frame computed in Swift.
         return """
         step("chartSlide", function() {
+            var pickedName = null;
             var master = (function() {
                 var masters = doc.masterSlides;
                 // Image-friendly masters first, falling back to Blank.
@@ -694,12 +849,21 @@ enum KeynoteExporter {
                 for (var p = 0; p < preferred.length; p++) {
                     try {
                         var m = masters[preferred[p]];
-                        m.name();
+                        var n = m.name();
+                        pickedName = n;
                         return m;
                     } catch (e) { /* try next */ }
                 }
-                return masters[0];
+                // Fall back to the first available master.
+                try {
+                    var first = masters[0];
+                    pickedName = first.name();
+                    return first;
+                } catch (e) {
+                    throw new Error("no master slides available on this document");
+                }
             })();
+            diagnostics.chartMaster = pickedName;
 
             var slide = kn.Slide({ baseSlide: master });
             doc.slides.push(slide);
@@ -745,8 +909,7 @@ enum KeynoteExporter {
             img.position = { x: targetX, y: targetY };
             img.width  = targetW;
             img.height = targetH;
-            // (Diagnostic value not surfaced today; if useful later we can
-            // return a JSON struct of these decisions back to Swift.)
+            diagnostics.chartPlacement = usedPlaceholder ? "placeholder" : "fallbackFrame";
         });
         """
     }
