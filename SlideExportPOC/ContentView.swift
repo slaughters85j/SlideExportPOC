@@ -30,8 +30,8 @@ struct ContentView: View {
         }
         .frame(minWidth: 800, minHeight: 600)
         .sheet(isPresented: $showingExportSheet) {
-            ExportSelectionView { items, format, template in
-                handleExport(items: items, format: format, template: template)
+            ExportSelectionView { items, format, aspect, template in
+                handleExport(items: items, format: format, aspect: aspect, template: template)
             }
         }
         .alert(
@@ -69,6 +69,9 @@ struct ContentView: View {
     private func alertButtons(for result: ExportResult) -> some View {
         switch result {
         case .success(let url):
+            Button("Open Export") {
+                NSWorkspace.shared.open(url)
+            }
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([url])
             }
@@ -219,7 +222,7 @@ struct ContentView: View {
 
     // MARK: Export handler
 
-    private func handleExport(items: [SlideItem], format: ExportFormat, template: URL?) {
+    private func handleExport(items: [SlideItem], format: ExportFormat, aspect: SlideAspect, template: URL?) {
         isExporting = true
         Task {
             defer { isExporting = false }
@@ -227,6 +230,7 @@ struct ContentView: View {
                 let url = try await KeynoteExporter.exportToKeynote(
                     items: items,
                     format: format,
+                    aspect: aspect,
                     customTemplateURL: template
                 )
                 exportResult = .success(url)

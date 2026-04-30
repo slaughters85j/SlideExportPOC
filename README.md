@@ -10,6 +10,9 @@ This is a **proof of concept**, not a library. It exists to validate an architec
 - Building a JXA script dynamically in Swift, with strict string escaping, and surfacing per-step errors back to the host app.
 - Rendering a SwiftUI Charts view to a PNG via `ImageRenderer` and embedding it as an image on a Keynote slide.
 - Exporting to `.pptx` (via Keynote's `export` verb) or saving as `.key` (via Keynote's `save` verb — they are different APIs; see below).
+- Output aspect ratio selection: **Wide (16:9, 1920×1080)** or **Standard (4:3, 1024×768)** — Keynote's own preset names.
+- Custom template support: `.kth` Keynote themes, `.key` and `.pptx` real presentations as base documents (all via `kn.open`). PowerPoint `.potx` is detected up-front and rejected with a clear remediation message (Keynote can't consume it; convert to `.pptx` first).
+- A placeholder-discovery experiment for the chart slide that demonstrates one path toward template-aware image placement (see Item 4 in "Gotchas" below).
 - Validating "is the genuine Apple Keynote installed?" via `SecRequirementCreateWithString` + `SecStaticCodeCheckValidity` against the requirement `anchor apple generic and identifier "com.apple.Keynote"`.
 
 ## Why
@@ -119,6 +122,33 @@ function step(name, fn) {
 ### 5. Apple Events permission is per-codesign, not per-installation
 
 If you change anything that affects the app's code signature (entitlements, Info.plist keys, signing identity) between builds, TCC may need to re-prompt. Conversely, if a previous build silently denied due to the issues above, the cached state can persist across builds. The in-app **Reset Permission & Quit** button runs `tccutil reset AppleEvents <bundle-id>` and terminates the app so the next launch starts fresh.
+
+### 6. Custom templates: viable for `.kth` / `.key` / `.pptx`, not viable for `.potx`
+
+Keynote's `kn.open(Path(...))` consumes Keynote themes (`.kth`), real Keynote presentations (`.key`), and PowerPoint presentations (`.pptx`) as base documents. Append your slides to whatever it returns and the resulting document inherits the template's theme, masters, and (for `.key` / `.pptx`) any pre-authored content.
+
+Things to know:
+
+- Opening a `.kth` for the first time may show Keynote's "Add to Theme Chooser" prompt. After accepting once, subsequent opens are silent.
+- When a custom template is supplied, the **template's slide dimensions win** — the aspect picker is informational only. The export sheet greys out the picker and notes this.
+- `.kth` templates produce a single auto-created starter slide; the script deletes that after appending its own content (matching the no-template flow).
+- `.key` and `.pptx` templates carry the user's existing slides; the script **does not** delete them — your slides are appended after the originals.
+
+PowerPoint `.potx` templates are not viable. Keynote's scripting interface has no path to consume them. Two workarounds, in order of pragmatism:
+
+1. Open the `.potx` in PowerPoint and Save As `.pptx`. Pick the resulting `.pptx` as the template here. (Recommended; documented in the in-app error message.)
+2. For a fully native PowerPoint pipeline that can consume `.potx` directly, you'd need a different tool entirely (e.g. a Python-side python-pptx step). Outside this PoC's scope.
+
+### 7. Cross-template image placement: text is template-agnostic, images are not (without effort)
+
+This is the question motivating the "polish, minimal-edit" goal. Findings from the `chartSlide` experiment in `KeynoteExporter.swift`:
+
+- **Text** binds cleanly to the master's `defaultTitleItem` and `defaultBodyItem`. On `.pptx` export Keynote maps these to PowerPoint's Title and Body placeholders, so typography, color, and position are controlled by the chosen template. Changing templates "just works" for title + body content.
+- **Images** are harder. Keynote's scripting model exposes `slide.images` (free-floating images you've added) and `slide.iWorkItems()` (everything on the slide), but does **not** expose a clean "drop my PNG into the master's image placeholder" API analogous to `defaultTitleItem`. PowerPoint's OOXML *does* have named picture placeholders, but Keynote's `.pptx` exporter generally rasterizes positioned images to absolute coordinates rather than emitting `<p:ph type="pic">` nodes. Round-tripping placeholder semantics through Keynote → `.pptx` is unreliable.
+
+The PoC implements a best-effort discovery pass: on the chart slide, after instantiating from a master (preferring "Photo - Horizontal" / "Photo" / "Blank"), it iterates `slide.iWorkItems()` looking for an image-class item large enough to be the master's hero placeholder. If found, the chart PNG steals that item's position and size and the original is deleted; if not, the chart falls back to an aspect-relative frame computed in Swift (≈8% horizontal, ≈13% vertical margins). Whether the placeholder pass actually finds anything depends entirely on the chosen master and how the template was authored.
+
+**Recommended pattern for production code** (e.g. a polished slide export in a real app): author **one canonical `.kth`** with deterministic master-slide names and known placeholder positions. In code, hardcode the mapping from app data to those known slots. This converts "discover what's there at runtime" into "place exactly here, every time." Multiple official templates (light, dark, corporate) can share the same master-slide names so the binding code stays the same — only the visual styling changes. This is the path the SlideExportPOC documents but does **not** itself implement, since one canonical template was out of scope.
 
 ## Status
 

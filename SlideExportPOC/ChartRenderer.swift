@@ -33,12 +33,11 @@ enum ChartRenderer {
 
     // MARK: API
 
-    /// Renders the chart to a 1600×800 PNG (matching the slide image frame
-    /// the JXA script positions) and returns the temp file URL.
+    /// Renders the chart to a PNG at the given size (matching the slide
+    /// image frame the JXA script positions) and returns the temp file URL.
+    /// Render scale is fixed at 2× for crispness.
     @MainActor
-    static func renderChartToPNG() throws -> URL {
-        let renderSize = CGSize(width: 1600, height: 800)
-
+    static func renderChartToPNG(size renderSize: CGSize) throws -> URL {
         let view = ChartView()
             .frame(width: renderSize.width, height: renderSize.height)
 

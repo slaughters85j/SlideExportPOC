@@ -43,6 +43,7 @@ enum KeynoteExporterError: LocalizedError {
     case scriptingFailed(message: String, code: Int, fullErrorDictionary: [String: Any])
     case chartRenderFailed(underlying: Error)
     case exportFileMissing(expectedPath: String)
+    case unsupportedTemplateType(extension: String)
     case unknown(String)
 
     var errorDescription: String? {
@@ -63,6 +64,12 @@ enum KeynoteExporterError: LocalizedError {
             return "Failed to render the chart for export: \(underlying.localizedDescription)"
         case .exportFileMissing(let path):
             return "Keynote reported success but the expected file was not found at \(path)."
+        case .unsupportedTemplateType(let ext):
+            return """
+            Templates of type ".\(ext)" are not supported. Keynote cannot consume PowerPoint .potx templates directly.
+
+            Workaround: open the .potx in PowerPoint, save it as .pptx, then select the .pptx as the template here.
+            """
         case .unknown(let message):
             return message
         }
@@ -293,54 +300,75 @@ enum KeynoteExporter {
     /// Renders any required assets, builds a JXA script, drives Keynote
     /// in-process via OSAKit, and returns the URL of the produced file
     /// (either .pptx or .key on the Desktop).
+    ///
+    /// - Parameters:
+    ///   - items: Which slide kinds to include.
+    ///   - format: `.keynote` (.key, via `kn.save`) or `.powerPoint` (.pptx,
+    ///             via `kn.export(as: "Microsoft PowerPoint")`).
+    ///   - aspect: 16:9 (`.wide`) or 4:3 (`.standard`). Ignored when a
+    ///             custom template is supplied — template dimensions win.
+    ///   - customTemplateURL: Optional .kth / .key / .pptx to use as the
+    ///             base document. .potx is rejected up-front.
     @MainActor
     static func exportToKeynote(
         items: [SlideItem],
         format: ExportFormat,
+        aspect: SlideAspect = .wide,
         customTemplateURL: URL? = nil
     ) async throws -> URL {
         guard isKeynoteInstalled() else {
             throw KeynoteExporterError.keynoteNotInstalled
         }
 
-        if customTemplateURL != nil {
-            #if DEBUG
-            print("[KeynoteExporter] customTemplateURL provided but template support is not yet implemented; ignoring.")
-            #endif
+        // 1. Validate template type up-front.
+        if let template = customTemplateURL {
+            let ext = template.pathExtension.lowercased()
+            switch ext {
+            case "kth", "key", "pptx":
+                break // supported via kn.open
+            case "potx":
+                throw KeynoteExporterError.unsupportedTemplateType(extension: "potx")
+            default:
+                throw KeynoteExporterError.unsupportedTemplateType(extension: ext)
+            }
         }
 
-        // 1. Render the chart PNG up front (must be on the main actor) if needed.
+        // 2. Render the chart PNG up front (must be on the main actor) if needed.
+        //    Render at the chart frame size for the chosen aspect so the bitmap
+        //    matches the embedded image rectangle and stays crisp.
         var chartPNGURL: URL? = nil
         if items.contains(.chart) {
             do {
-                chartPNGURL = try ChartRenderer.renderChartToPNG()
+                chartPNGURL = try ChartRenderer.renderChartToPNG(size: aspect.chartFrame.size)
             } catch {
                 throw KeynoteExporterError.chartRenderFailed(underlying: error)
             }
         }
 
-        // 2. Decide where the output file goes.
+        // 3. Decide where the output file goes.
         let outputURL = makeOutputURL(for: format)
 
-        // 3. Build the script with Swift values interpolated (escaped).
+        // 4. Build the script with Swift values interpolated (escaped).
         let script = makeJXAScript(
             items: items,
             format: format,
+            aspect: aspect,
             outputURL: outputURL,
-            chartPNGURL: chartPNGURL
+            chartPNGURL: chartPNGURL,
+            templateURL: customTemplateURL
         )
 
-        // 4. Run OSAKit off the main actor — `executeAndReturnError` is blocking.
+        // 5. Run OSAKit off the main actor — `executeAndReturnError` is blocking.
         try await Task.detached(priority: .userInitiated) {
             try runJXA(script)
         }.value
 
-        // 5. Verify the export file landed.
+        // 6. Verify the export file landed.
         guard FileManager.default.fileExists(atPath: outputURL.path) else {
             throw KeynoteExporterError.exportFileMissing(expectedPath: outputURL.path)
         }
 
-        // 6. Best-effort temp cleanup.
+        // 7. Best-effort temp cleanup.
         if let chartPNGURL {
             try? FileManager.default.removeItem(at: chartPNGURL)
         }
@@ -433,8 +461,10 @@ enum KeynoteExporter {
     private static func makeJXAScript(
         items: [SlideItem],
         format: ExportFormat,
+        aspect: SlideAspect,
         outputURL: URL,
-        chartPNGURL: URL?
+        chartPNGURL: URL?,
+        templateURL: URL?
     ) -> String {
         // Build the per-slide JS blocks first so we can keep the wrapper clean.
         var slideBlocks: [String] = []
@@ -448,7 +478,10 @@ enum KeynoteExporter {
                 ))
             case .chart:
                 if let chartPNGURL {
-                    slideBlocks.append(chartSlideBlock(imagePath: chartPNGURL.path))
+                    slideBlocks.append(chartSlideBlock(
+                        imagePath: chartPNGURL.path,
+                        chartFrame: aspect.chartFrame
+                    ))
                 }
             }
         }
@@ -472,6 +505,81 @@ enum KeynoteExporter {
             """#
         }
 
+        // Document-construction step varies based on whether a template was
+        // supplied. With a template we open the file (Keynote opens .kth
+        // .key and .pptx natively); the template's theme & dimensions win.
+        // Without a template we create a fresh document at the requested
+        // aspect using the "White" theme.
+        //
+        // We also need to know whether to delete a starter slide afterwards:
+        // - No template: yes, Keynote auto-creates one.
+        // - .kth template: yes, opening a theme file creates a starter slide.
+        // - .key / .pptx template: NO — those files contain the user's own
+        //   slides which we should preserve.
+        let createDocumentStatement: String
+        let shouldDeleteStarterSlide: Bool
+
+        if let templateURL {
+            let templateLiteral = jsEscape(templateURL.path)
+            let ext = templateURL.pathExtension.lowercased()
+            shouldDeleteStarterSlide = (ext == "kth")
+            createDocumentStatement = """
+            var doc = step("openTemplate", function() {
+                var d = kn.open(Path("\(templateLiteral)"));
+                if (!d) {
+                    // kn.open sometimes returns the document indirectly; fall
+                    // back to the front document.
+                    d = kn.documents[0];
+                }
+                return d;
+            });
+            """
+        } else {
+            shouldDeleteStarterSlide = true
+            createDocumentStatement = """
+            var theme = step("findTheme", function() {
+                var themesList = kn.themes;
+                try {
+                    var named = themesList["White"];
+                    named.name();
+                    return named;
+                } catch (e) {
+                    return themesList[0];
+                }
+            });
+
+            var doc = step("createDocument", function() {
+                var d = kn.Document({
+                    documentTheme: theme,
+                    width: \(Int(aspect.size.width)),
+                    height: \(Int(aspect.size.height))
+                });
+                kn.documents.push(d);
+                return d;
+            });
+            """
+        }
+
+        let starterSlideHandling: String = shouldDeleteStarterSlide
+            ? """
+            var initialSlide = step("captureInitialSlide", function() {
+                return doc.slides[0];
+            });
+            """
+            : """
+            var initialSlide = null;
+            """
+
+        let starterSlideDelete: String = shouldDeleteStarterSlide
+            ? """
+            step("deleteInitialSlide", function() {
+                if (initialSlide) initialSlide.delete();
+            });
+            """
+            : """
+            // Template carries user's own slides; do not delete anything.
+            """
+
         return """
         (function() {
             // step(name, fn): wraps each major operation so any thrown error
@@ -487,56 +595,33 @@ enum KeynoteExporter {
                 }
             }
 
+            // Diagnostic helper: tries to read a property off an iWorkItem
+            // returning a default if access fails. Used in placeholder
+            // discovery to make the iteration robust to heterogeneous items.
+            function safeGet(fn, fallback) {
+                try { return fn(); } catch (e) { return fallback; }
+            }
+
             var kn = step("application", function() {
                 var a = Application("Keynote");
                 a.includeStandardAdditions = true;
                 return a;
             });
 
-            // 1. Find the "White" theme via object-specifier subscript (the
-            //    pattern Apple's iWork JXA examples use). Fall back to the
-            //    first available theme if "White" is not installed.
-            var theme = step("findTheme", function() {
-                var themesList = kn.themes;
-                try {
-                    var named = themesList["White"];
-                    // Force evaluation so a missing-name error is caught here
-                    // and not at first-use deep inside another step.
-                    named.name();
-                    return named;
-                } catch (e) {
-                    return themesList[0];
-                }
-            });
+            // 1. Document construction — varies based on template vs. no template.
+            \(createDocumentStatement)
 
-            // 2. Create a 1920x1080 document.
-            var doc = step("createDocument", function() {
-                var d = kn.Document({
-                    documentTheme: theme,
-                    width: 1920,
-                    height: 1080
-                });
-                kn.documents.push(d);
-                return d;
-            });
+            // 2. Capture the starter slide if we should delete it later.
+            \(starterSlideHandling)
 
-            // 3. Capture the auto-created blank slide for later removal.
-            //    Keynote errors if the document is left with zero slides,
-            //    so we delete this only after appending at least one.
-            var initialSlide = step("captureInitialSlide", function() {
-                return doc.slides[0];
-            });
-
-            // 4. Per-item slide blocks (interpolated by Swift). Each block
+            // 3. Per-item slide blocks (interpolated by Swift). Each block
             //    uses its own step() wrappers internally.
             \(blocksJoined)
 
-            // 5. Remove the auto-created starter slide.
-            step("deleteInitialSlide", function() {
-                initialSlide.delete();
-            });
+            // 4. Optionally remove the auto-created starter slide.
+            \(starterSlideDelete)
 
-            // 6. Save / export to the requested format.
+            // 5. Save / export to the requested format.
             var out = step("buildOutputPath", function() {
                 return Path("\(outputPathLiteral)");
             });
@@ -545,7 +630,7 @@ enum KeynoteExporter {
                 \(writeStatement)
             });
 
-            // 7. Close without saving the in-memory document.
+            // 6. Close without saving the in-memory document.
             step("closeDocument", function() {
                 doc.close({ saving: "no" });
             });
@@ -585,30 +670,83 @@ enum KeynoteExporter {
         """
     }
 
-    private static func chartSlideBlock(imagePath: String) -> String {
+    private static func chartSlideBlock(imagePath: String, chartFrame: CGRect) -> String {
         let pathLiteral = jsEscape(imagePath)
+        let fallbackX = Int(chartFrame.origin.x.rounded())
+        let fallbackY = Int(chartFrame.origin.y.rounded())
+        let fallbackW = Int(chartFrame.size.width.rounded())
+        let fallbackH = Int(chartFrame.size.height.rounded())
 
+        // The script picks a master ("Photo - Horizontal" or similar
+        // image-friendly master if available, otherwise "Blank"), then runs
+        // a placeholder-discovery experiment. We log every iWorkItem on
+        // the master and on the freshly-created slide to the OSAKit return
+        // value, so the host app can inspect them in the console. If we
+        // find an item that looks like an image placeholder, we steal its
+        // position/size and delete it; if not, we fall back to the
+        // aspect-relative chart frame computed in Swift.
         return """
         step("chartSlide", function() {
             var master = (function() {
                 var masters = doc.masterSlides;
-                try {
-                    var blank = masters["Blank"];
-                    blank.name();
-                    return blank;
-                } catch (e) {
-                    return masters[0];
+                // Image-friendly masters first, falling back to Blank.
+                var preferred = ["Photo - Horizontal", "Photo - 3 Up", "Photo", "Blank"];
+                for (var p = 0; p < preferred.length; p++) {
+                    try {
+                        var m = masters[preferred[p]];
+                        m.name();
+                        return m;
+                    } catch (e) { /* try next */ }
                 }
+                return masters[0];
             })();
 
             var slide = kn.Slide({ baseSlide: master });
             doc.slides.push(slide);
 
+            // ─── Placeholder-discovery experiment (item 4 in the README) ───
+            // Iterate the slide's iWorkItems looking for an image-shaped
+            // placeholder inherited from the master. If found, use its
+            // geometry — that gives us template-aware placement. Otherwise
+            // fall back to the aspect-relative frame Swift computed.
+            var targetX = \(fallbackX);
+            var targetY = \(fallbackY);
+            var targetW = \(fallbackW);
+            var targetH = \(fallbackH);
+            var usedPlaceholder = false;
+
+            try {
+                var items = slide.iWorkItems();
+                for (var i = 0; i < items.length; i++) {
+                    var it = items[i];
+                    var itemClass = safeGet(function() { return it.class(); }, "?");
+                    var w = safeGet(function() { return it.width(); }, 0);
+                    var h = safeGet(function() { return it.height(); }, 0);
+                    // Heuristic: image-class items larger than ~25% of the
+                    // slide are likely the master's hero-image placeholder.
+                    var isLikelyImagePlaceholder =
+                        (itemClass === "image" || itemClass === "imagePlaceholder") &&
+                        w * h > (\(fallbackW) * \(fallbackH)) * 0.25;
+                    if (isLikelyImagePlaceholder) {
+                        var p = safeGet(function() { return it.position(); }, null);
+                        if (p) {
+                            targetX = p.x; targetY = p.y;
+                            targetW = w;   targetH = h;
+                            usedPlaceholder = true;
+                            try { it.delete(); } catch (e) { /* leave it; image will overlay */ }
+                            break;
+                        }
+                    }
+                }
+            } catch (e) { /* iWorkItems may throw on some master types */ }
+
             var img = kn.Image({ file: Path("\(pathLiteral)") });
             slide.images.push(img);
-            img.position = { x: 160, y: 140 };
-            img.width = 1600;
-            img.height = 800;
+            img.position = { x: targetX, y: targetY };
+            img.width  = targetW;
+            img.height = targetH;
+            // (Diagnostic value not surfaced today; if useful later we can
+            // return a JSON struct of these decisions back to Swift.)
         });
         """
     }

@@ -18,7 +18,7 @@ struct ExportSelectionView: View {
     // MARK: Inputs / outputs
 
     /// Called when the user taps Export. The view dismisses itself first.
-    var onExport: (_ items: [SlideItem], _ format: ExportFormat, _ template: URL?) -> Void
+    var onExport: (_ items: [SlideItem], _ format: ExportFormat, _ aspect: SlideAspect, _ template: URL?) -> Void
 
     // MARK: Local state
 
@@ -26,6 +26,7 @@ struct ExportSelectionView: View {
 
     @State private var selectedItems: Set<SlideItem> = Set(SlideItem.allCases)
     @State private var format: ExportFormat = .powerPoint
+    @State private var aspect: SlideAspect = .wide
     @State private var customTemplateURL: URL? = nil
 
     private let keynoteStatus: KeynoteInstallStatus = KeynoteExporter.keynoteInstallStatus()
@@ -47,6 +48,7 @@ struct ExportSelectionView: View {
 
                     slidesSection
                     formatSection
+                    aspectSection
                     customTemplateSection
                 }
                 .padding(20)
@@ -122,6 +124,26 @@ struct ExportSelectionView: View {
         }
     }
 
+    private var aspectSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("Aspect")
+            Picker("Aspect", selection: $aspect) {
+                ForEach(SlideAspect.allCases) { a in
+                    Text(a.displayLabel).tag(a)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(!isKeynoteInstalled || customTemplateURL != nil)
+
+            if customTemplateURL != nil {
+                Text("Aspect is set by the template when one is selected.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var customTemplateSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionLabel("Custom Template (optional)")
@@ -157,8 +179,9 @@ struct ExportSelectionView: View {
                 let items = SlideItem.allCases.filter { selectedItems.contains($0) }
                 let template = customTemplateURL
                 let chosenFormat = format
+                let chosenAspect = aspect
                 dismiss()
-                onExport(items, chosenFormat, template)
+                onExport(items, chosenFormat, chosenAspect, template)
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
@@ -211,5 +234,5 @@ struct ExportSelectionView: View {
 // MARK: - Preview
 
 #Preview {
-    ExportSelectionView { _, _, _ in }
+    ExportSelectionView { _, _, _, _ in }
 }
