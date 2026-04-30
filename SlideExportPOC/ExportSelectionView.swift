@@ -1,0 +1,215 @@
+//
+//  ExportSelectionView.swift
+//  SlideExportPOC
+//
+//  Modal sheet presented from ContentView. Lets the user pick which slide
+//  items to include, the output format, and an optional custom template
+//  before kicking off the export.
+//
+
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+// MARK: - ExportSelectionView
+
+struct ExportSelectionView: View {
+
+    // MARK: Inputs / outputs
+
+    /// Called when the user taps Export. The view dismisses itself first.
+    var onExport: (_ items: [SlideItem], _ format: ExportFormat, _ template: URL?) -> Void
+
+    // MARK: Local state
+
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var selectedItems: Set<SlideItem> = Set(SlideItem.allCases)
+    @State private var format: ExportFormat = .powerPoint
+    @State private var customTemplateURL: URL? = nil
+
+    private let keynoteStatus: KeynoteInstallStatus = KeynoteExporter.keynoteInstallStatus()
+    private var isKeynoteInstalled: Bool { keynoteStatus.isUsable }
+
+    // MARK: Body
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    if !isKeynoteInstalled {
+                        keynoteMissingNotice
+                    }
+
+                    slidesSection
+                    formatSection
+                    customTemplateSection
+                }
+                .padding(20)
+            }
+
+            Divider()
+
+            footer
+        }
+        .frame(width: 480, height: 480)
+    }
+
+    // MARK: Sections
+
+    private var header: some View {
+        Text("Select Slides to Export")
+            .font(.title3.weight(.semibold))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+    }
+
+    private var keynoteMissingNotice: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Keynote is required to export — even when exporting to PowerPoint.")
+                        .font(.callout.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(keynoteStatus.diagnostic)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if let foundURL = keynoteStatus.foundURL, !keynoteStatus.isUsable {
+                Text("Detected at: \(foundURL.path)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(12)
+        .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var slidesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("Slides")
+            ForEach(SlideItem.allCases) { item in
+                Toggle(isOn: binding(for: item)) {
+                    Text(item.displayLabel)
+                }
+                .toggleStyle(.checkbox)
+                .disabled(!isKeynoteInstalled)
+            }
+        }
+    }
+
+    private var formatSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("Format")
+            Picker("Format", selection: $format) {
+                ForEach(ExportFormat.allCases) { fmt in
+                    Text(fmt.displayLabel).tag(fmt)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(!isKeynoteInstalled)
+        }
+    }
+
+    private var customTemplateSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionLabel("Custom Template (optional)")
+            HStack(spacing: 8) {
+                Text(customTemplateURL?.lastPathComponent ?? "No template selected")
+                    .font(.callout)
+                    .foregroundStyle(customTemplateURL == nil ? .secondary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if customTemplateURL != nil {
+                    Button("Clear") { customTemplateURL = nil }
+                        .buttonStyle(.borderless)
+                }
+
+                Button("Choose…") { chooseTemplate() }
+                    .disabled(!isKeynoteInstalled)
+            }
+            Text("Using a custom template may result in required edits after export.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var footer: some View {
+        HStack {
+            Spacer()
+            Button("Cancel", role: .cancel) { dismiss() }
+                .keyboardShortcut(.cancelAction)
+            Button("Export") {
+                let items = SlideItem.allCases.filter { selectedItems.contains($0) }
+                let template = customTemplateURL
+                let chosenFormat = format
+                dismiss()
+                onExport(items, chosenFormat, template)
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+            .disabled(!isKeynoteInstalled || selectedItems.isEmpty)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
+    // MARK: Helpers
+
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.secondary)
+    }
+
+    private func binding(for item: SlideItem) -> Binding<Bool> {
+        Binding(
+            get: { selectedItems.contains(item) },
+            set: { isOn in
+                if isOn { selectedItems.insert(item) }
+                else    { selectedItems.remove(item) }
+            }
+        )
+    }
+
+    private func chooseTemplate() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a Template"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+
+        var allowedTypes: [UTType] = []
+        if let kth = UTType(filenameExtension: "kth")  { allowedTypes.append(kth) }
+        if let key = UTType(filenameExtension: "key")  { allowedTypes.append(key) }
+        if let pptx = UTType(filenameExtension: "pptx") { allowedTypes.append(pptx) }
+        if let potx = UTType(filenameExtension: "potx") { allowedTypes.append(potx) }
+        if !allowedTypes.isEmpty {
+            panel.allowedContentTypes = allowedTypes
+        }
+
+        if panel.runModal() == .OK, let url = panel.url {
+            customTemplateURL = url
+        }
+    }
+}
+
+// MARK: - Preview
+
+#Preview {
+    ExportSelectionView { _, _, _ in }
+}

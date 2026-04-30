@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  App Sandbox is disabled so OSAKit / Apple Events can drive Keynote
+	  freely. Note: with App Sandbox disabled we do NOT need the
+	  com.apple.security.scripting-targets sandbox-scoping entitlement.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+
+	<!--
+	  Required because ENABLE_HARDENED_RUNTIME = YES. Apple's Hardened
+	  Runtime blocks Apple Events by default; this entitlement is the
+	  documented exception that allows the app to send Apple Events to
+	  other applications (e.g. Keynote via JXA).
+
+	  Without this entitlement, hardened-runtime requests fail upstream of
+	  TCC — silently denied with errAEEventNotPermitted (-1743), no consent
+	  prompt is presented, and the app never appears in System Settings →
+	  Privacy & Security → Automation.
+
+	  See: Apple "Hardened Runtime" → Apple Events runtime exception.
+	-->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>
