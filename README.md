@@ -1,8 +1,37 @@
 # SlideExportPOC
 
-A small macOS SwiftUI app that demonstrates programmatic slide generation by driving Keynote.app via JXA (JavaScript for Automation) executed in-process through OSAKit, with export to either native Keynote (`.key`) or Microsoft PowerPoint (`.pptx`).
+A macOS SwiftUI app that explores **two independent paths for programmatic PowerPoint / Keynote export** from a Swift host app, and answers a real architectural question for a separate production project: how should we generate polished, branded slide decks without a fragile in-house slide library?
 
-This is a **proof of concept**, not a library. It exists to validate an architecture, document the gotchas, and serve as a reference implementation for anyone trying to do the same thing.
+This is a **proof of concept**, not a library. It exists to validate an architecture, document the gotchas, and serve as a reference implementation for the production migration.
+
+## TL;DR — the headline finding
+
+The standout result of this PoC is **`.potxOverlay` mode**, which generates a fully-branded PowerPoint `.pptx` **without using Keynote at all** — no Apple Events, no install dialogs, no app launch, not even a Keynote installation requirement for that path.
+
+It's pure Foundation: `XMLDocument` to inject content into a user-authored `.potx` template's existing placeholders, plus `/usr/bin/zip` and `/usr/bin/unzip` for OOXML packaging. The merger is ~500 LOC in [`SlideExportPOC/PPTXTemplateMerger.swift`](SlideExportPOC/PPTXTemplateMerger.swift) — single file, no dependencies.
+
+**Why this matters:** for a production macOS app that today depends on a SwiftUI/AppKit slide-rendering library to produce PowerPoint output, this path lets you replace the entire rendering pipeline with:
+
+1. Author one canonical `.potx` template with named placeholders (title, body, image, table, etc.).
+2. At export time, copy the `.potx`, flip the package MIME from template → presentation, locate placeholders by `<p:ph type="…">` predicate, inject content (text via `<a:t>`, images via `<p:pic>` + `ppt/media/` + `_rels`).
+3. Re-zip as `.pptx`. Done.
+
+The benefits over the Keynote/JXA path are substantial:
+
+| Concern | Keynote/JXA path | `.potxOverlay` path |
+|---|---|---|
+| Requires Keynote installed | **Yes** | No |
+| Requires Apple Events permission | **Yes** | No |
+| Triggers system consent dialog on first run | **Yes** | No |
+| Failure modes | OSAKit error codes, Apple Event timeouts, "no master slides available" | Plain Swift errors, XML parse failures |
+| Determinism | Subject to Keynote version differences | XML transforms are deterministic |
+| Visual fidelity vs. template | Approximate | Pixel-faithful — the `.potx` is the canvas |
+| Performance | ~1-2 seconds (Keynote launch overhead) | ~100ms |
+| Single-user / multi-user | Per-user permission state | Stateless |
+
+The flip side: the OOXML pipeline is restricted to PowerPoint output (no native `.key`), and you're responsible for binding content to the right placeholders. For a production app where the deck author also controls the template design, both constraints are mild.
+
+The Keynote/JXA path documented elsewhere in this README is still useful — it's the right tool when you want native `.key` output, when the user supplies an arbitrary template you don't control, or when you're scripting *any* iWork / Microsoft Office app rather than just generating files. Both paths in this PoC are kept in tree as reference implementations of distinct techniques.
 
 ## What it demonstrates
 
@@ -20,7 +49,7 @@ This is a **proof of concept**, not a library. It exists to validate an architec
 
 ## Why
 
-This was built to answer a single question for a separate project: **can OSAKit + JXA replace a fragile, image-incapable, in-house slide-export library** for a real macOS app's project-export feature? Answer: yes. The PoC successfully produces both `.key` and `.pptx` files with embedded images.
+This was built to answer a single question for a separate project: **can we replace a fragile, image-incapable, in-house slide-export library** with something polished and deterministic? Answer: yes — and surprisingly, the cleanest answer turned out to *not* involve Keynote at all (see "TL;DR — the headline finding" above). The Keynote/JXA path also works and is well-documented here, but the pure-XML `.potxOverlay` path is the one we'd reach for first.
 
 ## Stack
 
